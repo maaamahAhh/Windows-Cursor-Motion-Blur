@@ -2,6 +2,8 @@
 
 C++ implementation for adding motion blur effects to Windows cursors.
 
+<img width="256" height="140" alt="blur" src="https://github.com/user-attachments/assets/73b7e075-6b06-4065-9570-1510128275fc" />
+
 ## Features
 
 - Captures mouse movements via low-level hook
