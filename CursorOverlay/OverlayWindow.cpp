@@ -8,6 +8,7 @@ OverlayWindow::OverlayWindow()
     , hInstance_(GetModuleHandle(nullptr))
     , hdc_(nullptr)
     , hdcMem_(nullptr)
+    , hdcTemp_(nullptr)
     , hbmMem_(nullptr)
     , hbmOld_(nullptr)
     , pvBits_(nullptr)
@@ -16,6 +17,9 @@ OverlayWindow::OverlayWindow()
     , mouseHook_(nullptr)
     , running_(false)
     , cursorHotspot_{0, 0}
+    , cursorWidth_(0)
+    , cursorHeight_(0)
+    , hbmTemp_(nullptr)
 {
 }
 
@@ -100,6 +104,16 @@ void OverlayWindow::Close() {
         mouseHook_->Uninstall();
         DestroyMouseHook(mouseHook_);
         mouseHook_ = nullptr;
+    }
+
+    if (hbmTemp_) {
+        DeleteObject(hbmTemp_);
+        hbmTemp_ = nullptr;
+    }
+
+    if (hdcTemp_) {
+        DeleteDC(hdcTemp_);
+        hdcTemp_ = nullptr;
     }
 
     if (hbmOld_ && hdcMem_) {
@@ -221,56 +235,21 @@ void OverlayWindow::RenderMotionBlur() {
 
 void OverlayWindow::DrawCursorCopy(POINT pos, BYTE alpha) {
     HBITMAP hbmCursor = motionBlur_.GetCursorBitmap();
-    if (!hbmCursor) {
+    if (!hbmCursor || !hdcTemp_ || !hbmTemp_) {
         return;
     }
 
-    BITMAP bm = {0};
-    GetObject(hbmCursor, sizeof(BITMAP), &bm);
+    HGDIOBJ hOldTemp = SelectObject(hdcTemp_, hbmCursor);
+    BitBlt(hdcMem_, pos.x - cursorHotspot_.x, pos.y - cursorHotspot_.y, 
+           cursorWidth_, cursorHeight_, hdcTemp_, 0, 0, SRCCOPY);
+    SelectObject(hdcTemp_, hOldTemp);
 
-    HDC hdcTemp = CreateCompatibleDC(hdcMem_);
-    HBITMAP hbmOld = (HBITMAP)SelectObject(hdcTemp, hbmCursor);
-
-    BITMAPINFO bmi = {0};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = bm.bmWidth;
-    bmi.bmiHeader.biHeight = -bm.bmHeight;
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    VOID* pvBits = nullptr;
-    HBITMAP hbmAlpha = CreateDIBSection(hdcMem_, &bmi, DIB_RGB_COLORS, &pvBits, nullptr, 0);
-    HDC hdcAlpha = CreateCompatibleDC(hdcMem_);
-    HBITMAP hbmAlphaOld = (HBITMAP)SelectObject(hdcAlpha, hbmAlpha);
-
-    BitBlt(hdcAlpha, 0, 0, bm.bmWidth, bm.bmHeight, hdcTemp, 0, 0, SRCCOPY);
-
-    BYTE* pPixels = (BYTE*)pvBits;
-    for (int y = 0; y < bm.bmHeight; ++y) {
-        for (int x = 0; x < bm.bmWidth; ++x) {
-            int idx = (y * bm.bmWidth + x) * 4;
-            BYTE b = pPixels[idx];
-            BYTE g = pPixels[idx + 1];
-            BYTE r = pPixels[idx + 2];
-            BYTE a = pPixels[idx + 3];
-
-            if (r > 0 || g > 0 || b > 0) {
-                pPixels[idx + 3] = alpha;
-            }
-        }
+    if (alpha < 255) {
+        BLENDFUNCTION blend = {AC_SRC_OVER, 0, alpha, AC_SRC_ALPHA};
+        AlphaBlend(hdcMem_, pos.x - cursorHotspot_.x, pos.y - cursorHotspot_.y,
+                   cursorWidth_, cursorHeight_, hdcMem_, pos.x - cursorHotspot_.x, pos.y - cursorHotspot_.y,
+                   cursorWidth_, cursorHeight_, blend);
     }
-
-    BLENDFUNCTION blend = {AC_SRC_OVER, 0, alpha, AC_SRC_ALPHA};
-    AlphaBlend(hdcMem_, pos.x - cursorHotspot_.x, pos.y - cursorHotspot_.y,
-               bm.bmWidth, bm.bmHeight, hdcAlpha, 0, 0, bm.bmWidth, bm.bmHeight, blend);
-
-    SelectObject(hdcAlpha, hbmAlphaOld);
-    DeleteObject(hbmAlpha);
-    DeleteDC(hdcAlpha);
-
-    SelectObject(hdcTemp, hbmOld);
-    DeleteDC(hdcTemp);
 }
 
 void OverlayWindow::UpdateWindow() {
@@ -294,19 +273,24 @@ bool OverlayWindow::LoadCursorImage() {
     BITMAP bm = {0};
     GetObject(iconInfo.hbmColor ? iconInfo.hbmColor : iconInfo.hbmMask, sizeof(BITMAP), &bm);
 
-    HDC hdc = GetDC(nullptr);
-    HDC hdcMem = CreateCompatibleDC(hdc);
-    hbmMem_ = CreateCompatibleBitmap(hdc, 32, 32);
+    cursorWidth_ = bm.bmWidth > 0 ? bm.bmWidth : 32;
+    cursorHeight_ = bm.bmHeight > 0 ? bm.bmHeight : 32;
 
-    SelectObject(hdcMem, hbmMem_);
+    HDC hdcScreen = GetDC(nullptr);
+    hdcTemp_ = CreateCompatibleDC(hdcScreen);
+    hbmTemp_ = CreateCompatibleBitmap(hdcScreen, cursorWidth_, cursorHeight_);
+    
+    HBITMAP hbmOld = (HBITMAP)SelectObject(hdcTemp_, hbmTemp_);
+    
     if (iconInfo.hbmColor) {
-        DrawIconEx(hdcMem, 0, 0, hCursor, 32, 32, 0, nullptr, DI_NORMAL);
+        DrawIconEx(hdcTemp_, 0, 0, hCursor, cursorWidth_, cursorHeight_, 0, nullptr, DI_NORMAL);
     }
+    
+    SelectObject(hdcTemp_, hbmOld);
+    
+    motionBlur_.SetCursorBitmap(hbmTemp_);
 
-    DeleteDC(hdcMem);
-    ReleaseDC(nullptr, hdc);
-
-    motionBlur_.SetCursorBitmap(hbmMem_);
+    ReleaseDC(nullptr, hdcScreen);
 
     if (iconInfo.hbmMask) DeleteObject(iconInfo.hbmMask);
     if (iconInfo.hbmColor) DeleteObject(iconInfo.hbmColor);

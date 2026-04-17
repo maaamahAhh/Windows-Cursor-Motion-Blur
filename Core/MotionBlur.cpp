@@ -56,7 +56,7 @@ float MotionBlur::CalculateSpeed() {
         return 0.0f;
     }
 
-    size_t sampleCount = std::min(size_t(5), positionHistory_.size());
+    size_t sampleCount = (std::min)(size_t(5), positionHistory_.size());
     auto& last = positionHistory_.back();
     auto& first = positionHistory_[positionHistory_.size() - sampleCount];
 
@@ -76,7 +76,7 @@ float MotionBlur::CalculateSpeed() {
 }
 
 void MotionBlur::AdjustParametersBySpeed(float speed) {
-    float normalizedSpeed = std::min(speed / 5.0f, 1.0f);
+    float normalizedSpeed = (std::min)(speed / 5.0f, 1.0f);
 
     config_.delayPerCopy = config_.maxDelayPerCopy - normalizedSpeed * (config_.maxDelayPerCopy - config_.minDelayPerCopy);
 

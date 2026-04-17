@@ -28,6 +28,7 @@ private:
     HINSTANCE hInstance_;
     HDC hdc_;
     HDC hdcMem_;
+    HDC hdcTemp_;
     HBITMAP hbmMem_;
     HBITMAP hbmOld_;
     VOID* pvBits_;
@@ -37,4 +38,7 @@ private:
     MouseHook* mouseHook_;
     bool running_;
     POINT cursorHotspot_;
+    int cursorWidth_;
+    int cursorHeight_;
+    HBITMAP hbmTemp_;
 };
