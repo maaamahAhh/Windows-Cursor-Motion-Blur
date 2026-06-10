@@ -1,7 +1,10 @@
 #include "OverlayWindow.h"
-#include <cmath>
+#include <cstring>
 
 static OverlayWindow* g_windowInstance = nullptr;
+
+constexpr int BYTES_PER_PIXEL = 4;
+constexpr BYTE ALPHA_MAX = 255;
 
 OverlayWindow::OverlayWindow()
     : hwnd_(nullptr)
@@ -13,9 +16,14 @@ OverlayWindow::OverlayWindow()
     , pvBits_(nullptr)
     , screenWidth_(0)
     , screenHeight_(0)
+    , cursorDc_(nullptr)
+    , cursorDib_(nullptr)
+    , cursorDibOld_(nullptr)
+    , cursorWidth_(0)
+    , cursorHeight_(0)
+    , cursorHotspot_{0, 0}
     , mouseHook_(nullptr)
     , running_(false)
-    , cursorHotspot_{0, 0}
 {
 }
 
@@ -29,28 +37,19 @@ bool OverlayWindow::Initialize() {
     screenWidth_ = GetSystemMetrics(SM_CXSCREEN);
     screenHeight_ = GetSystemMetrics(SM_CYSCREEN);
 
-    if (!RegisterWindowClass()) {
-        return false;
-    }
+    if (!RegisterWindowClass()) return false;
+    if (!CreateWindowHandle()) return false;
 
-    if (!CreateWindowHandle()) {
-        return false;
-    }
+    motionBlur_.initialize();
 
-    motionBlur_.Initialize();
-
-    if (!LoadCursorImage()) {
-        return false;
-    }
+    if (!LoadCursorImage()) return false;
 
     mouseHook_ = CreateMouseHook();
-    if (!mouseHook_) {
-        return false;
-    }
+    if (!mouseHook_) return false;
 
-    if (!mouseHook_->Install([](POINT pos, LPARAM lParam) {
+    if (!mouseHook_->Install([](POINT pos, LPARAM) {
         if (g_windowInstance) {
-            g_windowInstance->OnMouseMove(pos, lParam);
+            g_windowInstance->OnMouseMove(pos, 0);
         }
     })) {
         DestroyMouseHook(mouseHook_);
@@ -58,35 +57,15 @@ bool OverlayWindow::Initialize() {
         return false;
     }
 
-    hdc_ = GetDC(hwnd_);
-    hdcMem_ = CreateCompatibleDC(hdc_);
+    if (!CreateFramebuffer()) return false;
 
-    BITMAPINFO bmi = {0};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = screenWidth_;
-    bmi.bmiHeader.biHeight = -screenHeight_;
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    pvBits_ = nullptr;
-    hbmMem_ = CreateDIBSection(hdc_, &bmi, DIB_RGB_COLORS, &pvBits_, nullptr, 0);
-    if (!hbmMem_) {
-        return false;
-    }
-    hbmOld_ = (HBITMAP)SelectObject(hdcMem_, hbmMem_);
-
-    if (pvBits_) {
-        memset(pvBits_, 0, screenWidth_ * screenHeight_ * 4);
-    }
-
+    SetTimer(hwnd_, RENDER_TIMER_ID, RENDER_INTERVAL_MS, nullptr);
     return true;
 }
 
 void OverlayWindow::Run() {
     running_ = true;
     MSG msg;
-
     while (running_ && GetMessage(&msg, nullptr, 0, 0)) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
@@ -96,37 +75,23 @@ void OverlayWindow::Run() {
 void OverlayWindow::Close() {
     running_ = false;
 
+    if (hwnd_) KillTimer(hwnd_, RENDER_TIMER_ID);
+
     if (mouseHook_) {
         mouseHook_->Uninstall();
         DestroyMouseHook(mouseHook_);
         mouseHook_ = nullptr;
     }
 
-    if (hbmOld_ && hdcMem_) {
-        SelectObject(hdcMem_, hbmOld_);
-    }
-
-    if (hbmMem_) {
-        DeleteObject(hbmMem_);
-        hbmMem_ = nullptr;
-    }
-
-    if (hdcMem_) {
-        DeleteDC(hdcMem_);
-        hdcMem_ = nullptr;
-    }
-
-    if (hdc_) {
-        ReleaseDC(hwnd_, hdc_);
-        hdc_ = nullptr;
-    }
+    ReleaseCursorResources();
+    ReleaseFramebuffer();
 
     if (hwnd_) {
         DestroyWindow(hwnd_);
         hwnd_ = nullptr;
     }
 
-    motionBlur_.Clear();
+    motionBlur_.clear();
 }
 
 HWND OverlayWindow::GetHandle() const {
@@ -134,7 +99,7 @@ HWND OverlayWindow::GetHandle() const {
 }
 
 bool OverlayWindow::RegisterWindowClass() {
-    WNDCLASSEX wc = {0};
+    WNDCLASSEX wc = {};
     wc.cbSize = sizeof(WNDCLASSEX);
     wc.style = CS_HREDRAW | CS_VREDRAW;
     wc.lpfnWndProc = WindowProc;
@@ -142,7 +107,6 @@ bool OverlayWindow::RegisterWindowClass() {
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)GetStockObject(NULL_BRUSH);
     wc.lpszClassName = L"CursorMotionBlurOverlay";
-
     return RegisterClassEx(&wc) != 0;
 }
 
@@ -152,23 +116,13 @@ bool OverlayWindow::CreateWindowHandle() {
         L"CursorMotionBlurOverlay",
         L"Cursor Motion Blur",
         WS_POPUP,
-        0,
-        0,
-        screenWidth_,
-        screenHeight_,
-        nullptr,
-        nullptr,
-        hInstance_,
-        nullptr
+        0, 0, screenWidth_, screenHeight_,
+        nullptr, nullptr, hInstance_, nullptr
     );
-
-    if (!hwnd_) {
-        return false;
-    }
+    if (!hwnd_) return false;
 
     ShowWindow(hwnd_, SW_SHOW);
     ::UpdateWindow(hwnd_);
-
     return true;
 }
 
@@ -177,139 +131,185 @@ LRESULT CALLBACK OverlayWindow::WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, 
         case WM_DESTROY:
             PostQuitMessage(0);
             return 0;
-
+        case WM_DISPLAYCHANGE:
+            if (g_windowInstance) {
+                g_windowInstance->OnDisplayChange();
+            }
+            return 0;
+        case WM_TIMER:
+            if (wParam == RENDER_TIMER_ID && g_windowInstance) {
+                g_windowInstance->RenderMotionBlur();
+            }
+            return 0;
         case WM_PAINT:
+        case WM_RENDERBLUR:
             if (g_windowInstance) {
                 g_windowInstance->RenderMotionBlur();
             }
             return 0;
-
         default:
             return DefWindowProc(hwnd, uMsg, wParam, lParam);
     }
 }
 
-void OverlayWindow::OnMouseMove(POINT pos, LPARAM lParam) {
-    motionBlur_.AddPosition(pos);
+void OverlayWindow::OnMouseMove(POINT pos, LPARAM) {
+    motionBlur_.addCursorPosition(pos);
+    PostMessage(hwnd_, WM_RENDERBLUR, 0, 0);
+}
 
-    UpdateWindow();
+void OverlayWindow::OnDisplayChange() {
+    screenWidth_ = GetSystemMetrics(SM_CXSCREEN);
+    screenHeight_ = GetSystemMetrics(SM_CYSCREEN);
+
+    ReleaseFramebuffer();
+    CreateFramebuffer();
 }
 
 void OverlayWindow::RenderMotionBlur() {
-    if (!hdc_ || !hdcMem_ || !pvBits_) {
-        return;
+    if (!pvBits_ || !cursorDc_) return;
+
+    ClearFramebuffer();
+
+    const auto ghosts = motionBlur_.getGhostPositions();
+    const auto& config = motionBlur_.getConfig();
+
+    for (int i = 0; i < config.ghostCount; ++i) {
+        BYTE alpha = static_cast<BYTE>(motionBlur_.ghostOpacityFor(i) * ALPHA_MAX);
+        DrawCursorCopy(ghosts[i], alpha);
     }
 
-    memset(pvBits_, 0, screenWidth_ * screenHeight_ * 4);
-
-    auto positions = motionBlur_.GetCursorCopyPositions();
-
-    for (size_t i = 0; i < positions.size(); ++i) {
-        float normalizedPos = static_cast<float>(i) / static_cast<float>(positions.size() - 1);
-        float alpha = motionBlur_.GetConfig().baseOpacity * (0.2f + 0.8f * normalizedPos);
-
-        BYTE alphaByte = static_cast<BYTE>(alpha * 255);
-        DrawCursorCopy(positions[i], alphaByte);
-    }
-
-    POINT ptSrc = {0, 0};
-    SIZE sizeWnd = {screenWidth_, screenHeight_};
-    BLENDFUNCTION blend = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-
-    UpdateLayeredWindow(hwnd_, nullptr, nullptr, &sizeWnd, hdcMem_, &ptSrc, 0, &blend, ULW_ALPHA);
+    PresentFramebuffer();
 }
 
 void OverlayWindow::DrawCursorCopy(POINT pos, BYTE alpha) {
-    HBITMAP hbmCursor = motionBlur_.GetCursorBitmap();
-    if (!hbmCursor) {
-        return;
-    }
-
-    BITMAP bm = {0};
-    GetObject(hbmCursor, sizeof(BITMAP), &bm);
-
-    HDC hdcTemp = CreateCompatibleDC(hdcMem_);
-    HBITMAP hbmOld = (HBITMAP)SelectObject(hdcTemp, hbmCursor);
-
-    BITMAPINFO bmi = {0};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = bm.bmWidth;
-    bmi.bmiHeader.biHeight = -bm.bmHeight;
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    VOID* pvBits = nullptr;
-    HBITMAP hbmAlpha = CreateDIBSection(hdcMem_, &bmi, DIB_RGB_COLORS, &pvBits, nullptr, 0);
-    HDC hdcAlpha = CreateCompatibleDC(hdcMem_);
-    HBITMAP hbmAlphaOld = (HBITMAP)SelectObject(hdcAlpha, hbmAlpha);
-
-    BitBlt(hdcAlpha, 0, 0, bm.bmWidth, bm.bmHeight, hdcTemp, 0, 0, SRCCOPY);
-
-    BYTE* pPixels = (BYTE*)pvBits;
-    for (int y = 0; y < bm.bmHeight; ++y) {
-        for (int x = 0; x < bm.bmWidth; ++x) {
-            int idx = (y * bm.bmWidth + x) * 4;
-            BYTE b = pPixels[idx];
-            BYTE g = pPixels[idx + 1];
-            BYTE r = pPixels[idx + 2];
-            BYTE a = pPixels[idx + 3];
-
-            if (r > 0 || g > 0 || b > 0) {
-                pPixels[idx + 3] = alpha;
-            }
-        }
-    }
-
     BLENDFUNCTION blend = {AC_SRC_OVER, 0, alpha, AC_SRC_ALPHA};
-    AlphaBlend(hdcMem_, pos.x - cursorHotspot_.x, pos.y - cursorHotspot_.y,
-               bm.bmWidth, bm.bmHeight, hdcAlpha, 0, 0, bm.bmWidth, bm.bmHeight, blend);
-
-    SelectObject(hdcAlpha, hbmAlphaOld);
-    DeleteObject(hbmAlpha);
-    DeleteDC(hdcAlpha);
-
-    SelectObject(hdcTemp, hbmOld);
-    DeleteDC(hdcTemp);
-}
-
-void OverlayWindow::UpdateWindow() {
-    InvalidateRect(hwnd_, nullptr, TRUE);
+    AlphaBlend(hdcMem_,
+               pos.x - cursorHotspot_.x, pos.y - cursorHotspot_.y,
+               cursorWidth_, cursorHeight_,
+               cursorDc_, 0, 0,
+               cursorWidth_, cursorHeight_, blend);
 }
 
 bool OverlayWindow::LoadCursorImage() {
     HCURSOR hCursor = LoadCursor(nullptr, IDC_ARROW);
-    if (!hCursor) {
-        return false;
-    }
+    if (!hCursor) return false;
 
-    ICONINFO iconInfo = {0};
-    if (!GetIconInfo(hCursor, &iconInfo)) {
-        return false;
-    }
+    ICONINFO iconInfo = {};
+    if (!GetIconInfo(hCursor, &iconInfo)) return false;
 
     cursorHotspot_.x = iconInfo.xHotspot;
     cursorHotspot_.y = iconInfo.yHotspot;
 
-    BITMAP bm = {0};
-    GetObject(iconInfo.hbmColor ? iconInfo.hbmColor : iconInfo.hbmMask, sizeof(BITMAP), &bm);
+    BITMAP bm = {};
+    GetObject(iconInfo.hbmColor ? iconInfo.hbmColor : iconInfo.hbmMask,
+              sizeof(BITMAP), &bm);
+    cursorWidth_ = bm.bmWidth > 0 ? bm.bmWidth : 32;
+    cursorHeight_ = bm.bmHeight > 0 ? bm.bmHeight : 32;
 
-    HDC hdc = GetDC(nullptr);
-    HDC hdcMem = CreateCompatibleDC(hdc);
-    hbmMem_ = CreateCompatibleBitmap(hdc, 32, 32);
+    HDC screenDc = GetDC(nullptr);
+    cursorDib_ = CreateCursorDib(screenDc);
+    cursorDc_ = CreateCompatibleDC(screenDc);
 
-    SelectObject(hdcMem, hbmMem_);
-    if (iconInfo.hbmColor) {
-        DrawIconEx(hdcMem, 0, 0, hCursor, 32, 32, 0, nullptr, DI_NORMAL);
+    if (!cursorDib_ || !cursorDc_) {
+        if (iconInfo.hbmMask) DeleteObject(iconInfo.hbmMask);
+        if (iconInfo.hbmColor) DeleteObject(iconInfo.hbmColor);
+        ReleaseDC(nullptr, screenDc);
+        return false;
     }
 
-    DeleteDC(hdcMem);
-    ReleaseDC(nullptr, hdc);
+    cursorDibOld_ = (HBITMAP)SelectObject(cursorDc_, cursorDib_);
 
-    motionBlur_.SetCursorBitmap(hbmMem_);
+    if (iconInfo.hbmColor) {
+        DrawIconEx(cursorDc_, 0, 0, hCursor,
+                   cursorWidth_, cursorHeight_, 0, nullptr, DI_NORMAL);
+    }
+
+    ReleaseDC(nullptr, screenDc);
 
     if (iconInfo.hbmMask) DeleteObject(iconInfo.hbmMask);
     if (iconInfo.hbmColor) DeleteObject(iconInfo.hbmColor);
-
     return true;
+}
+
+void OverlayWindow::ReleaseCursorResources() {
+    if (cursorDibOld_ && cursorDc_) {
+        SelectObject(cursorDc_, cursorDibOld_);
+        cursorDibOld_ = nullptr;
+    }
+    if (cursorDib_) {
+        DeleteObject(cursorDib_);
+        cursorDib_ = nullptr;
+    }
+    if (cursorDc_) {
+        DeleteDC(cursorDc_);
+        cursorDc_ = nullptr;
+    }
+}
+
+BITMAPINFO OverlayWindow::CreateBitmapInfo(int width, int height) {
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = width;
+    bmi.bmiHeader.biHeight = -height;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    return bmi;
+}
+
+bool OverlayWindow::CreateFramebuffer() {
+    hdc_ = GetDC(hwnd_);
+    hdcMem_ = CreateCompatibleDC(hdc_);
+
+    BITMAPINFO bmi = CreateBitmapInfo(screenWidth_, screenHeight_);
+
+    hbmMem_ = CreateDIBSection(hdc_, &bmi, DIB_RGB_COLORS, &pvBits_, nullptr, 0);
+    if (!hbmMem_) {
+        DeleteDC(hdcMem_);
+        hdcMem_ = nullptr;
+        ReleaseDC(hwnd_, hdc_);
+        hdc_ = nullptr;
+        return false;
+    }
+
+    hbmOld_ = (HBITMAP)SelectObject(hdcMem_, hbmMem_);
+    ClearFramebuffer();
+    return true;
+}
+
+void OverlayWindow::ReleaseFramebuffer() {
+    if (hbmOld_ && hdcMem_) {
+        SelectObject(hdcMem_, hbmOld_);
+    }
+    if (hbmMem_) {
+        DeleteObject(hbmMem_);
+        hbmMem_ = nullptr;
+    }
+    if (hdcMem_) {
+        DeleteDC(hdcMem_);
+        hdcMem_ = nullptr;
+    }
+    if (hdc_) {
+        ReleaseDC(hwnd_, hdc_);
+        hdc_ = nullptr;
+    }
+}
+
+void OverlayWindow::ClearFramebuffer() {
+    std::memset(pvBits_, 0,
+        static_cast<size_t>(screenWidth_) * screenHeight_ * BYTES_PER_PIXEL);
+}
+
+void OverlayWindow::PresentFramebuffer() {
+    POINT sourceOrigin = {0, 0};
+    SIZE windowSize = {screenWidth_, screenHeight_};
+    BLENDFUNCTION blend = {AC_SRC_OVER, 0, ALPHA_MAX, AC_SRC_ALPHA};
+    UpdateLayeredWindow(hwnd_, nullptr, nullptr, &windowSize,
+                        hdcMem_, &sourceOrigin, 0, &blend, ULW_ALPHA);
+}
+
+HBITMAP OverlayWindow::CreateCursorDib(HDC compatibleDc) {
+    BITMAPINFO bmi = CreateBitmapInfo(cursorWidth_, cursorHeight_);
+    return CreateDIBSection(compatibleDc, &bmi, DIB_RGB_COLORS,
+                            nullptr, nullptr, 0);
 }

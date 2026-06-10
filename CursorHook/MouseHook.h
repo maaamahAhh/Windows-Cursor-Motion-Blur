@@ -3,12 +3,12 @@
 #include <windows.h>
 
 #ifdef CURSORHOOK_EXPORTS
-#define MOUSEHOOK_CLASS __declspec(dllexport)
+#define CURSORHOOK_API __declspec(dllexport)
 #else
-#define MOUSEHOOK_CLASS __declspec(dllimport)
+#define CURSORHOOK_API __declspec(dllimport)
 #endif
 
-class MOUSEHOOK_CLASS MouseHook {
+class CURSORHOOK_API MouseHook {
 public:
     typedef void (*MouseMoveCallback)(POINT pos, LPARAM lParam);
 
@@ -26,12 +26,6 @@ private:
     MouseMoveCallback callback_;
     bool installed_;
 };
-
-#ifdef CURSORHOOK_EXPORTS
-#define CURSORHOOK_API __declspec(dllexport)
-#else
-#define CURSORHOOK_API __declspec(dllimport)
-#endif
 
 extern "C" {
     CURSORHOOK_API MouseHook* CreateMouseHook();

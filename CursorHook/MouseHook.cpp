@@ -63,13 +63,10 @@ bool MouseHook::IsInstalled() const {
 }
 
 LRESULT CALLBACK MouseHook::LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode >= 0) {
-        if (wParam == WM_MOUSEMOVE) {
-            MSLLHOOKSTRUCT* pMouseStruct = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
-            if (pMouseStruct && g_hookInstance && g_hookInstance->callback_) {
-                POINT pos = pMouseStruct->pt;
-                g_hookInstance->callback_(pos, lParam);
-            }
+    if (nCode >= 0 && wParam == WM_MOUSEMOVE) {
+        MSLLHOOKSTRUCT* pMouseStruct = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
+        if (pMouseStruct && g_hookInstance && g_hookInstance->callback_) {
+            g_hookInstance->callback_(pMouseStruct->pt, lParam);
         }
     }
 
