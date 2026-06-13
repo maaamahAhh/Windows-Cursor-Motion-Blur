@@ -14,6 +14,11 @@ if(WIN32)
     if(MSVC)
         add_definitions(/wd4996)  # 禁用不安全函数警告
     endif()
+
+    if(MINGW)
+        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static -Wl,--allow-multiple-definition")
+        set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -static")
+    endif()
 endif()
 
 # 源文件目录
